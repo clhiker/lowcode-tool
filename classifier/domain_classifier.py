@@ -160,12 +160,8 @@ def main():
                         help="config.ini 中的配置节名称（默认 sjtu_minimax）")
     parser.add_argument("--gbt", default="classifier/gbt4754_2017_小类.txt",
                         help="GB/T 4754-2017 小类代码文件路径")
-    parser.add_argument("-n", "--batch-size", type=int, default=20,
-                        help="每次API调用合并的模板数（默认20）")
-    parser.add_argument("--retry-until-valid", action="store_true",
-                        help="无限重试直到所有代码校验通过（默认关闭）")
-    parser.add_argument("--max-validation-retries", type=int, default=2,
-                        help="校验失败后最大重试次数，仅在未启用 --retry-until-valid 时生效（默认2）")
+    parser.add_argument("-n", "--batch-size", type=int, default=50,
+                        help="每次API调用合并的模板数（默认50）")
     args = parser.parse_args()
 
     cfg = load_config(args.config, args.section)
@@ -197,14 +193,25 @@ def main():
 
     total = len(items)
     n = args.batch_size
-    max_val_retries = float("inf") if args.retry_until_valid else args.max_validation_retries
-    retry_label = "无限" if args.retry_until_valid else str(max_val_retries)
-    print(f"共 {total} 个模板，batch-size={n}，校验重试={retry_label} 次\n")
+    print(f"共 {total} 个模板，batch-size={n}，校验重试=无限 次\n")
 
-    col_new1 = ws.max_column + 1
-    col_new2 = col_new1 + 1
-    ws.cell(row=1, column=col_new1).value = "新增列1"
-    ws.cell(row=1, column=col_new2).value = "新增列2"
+    col_new1 = col_new2 = None
+    for col in range(1, ws.max_column + 1):
+        h = ws.cell(row=1, column=col).value
+        if h == "新增列1":
+            col_new1 = col
+        elif h == "新增列2":
+            col_new2 = col
+    if col_new1 is None:
+        col_new1 = ws.max_column + 1
+        ws.cell(row=1, column=col_new1).value = "新增列1"
+    if col_new2 is None:
+        col_new2 = col_new1 + 1
+        ws.cell(row=1, column=col_new2).value = "新增列2"
+    # 清除这两列中之前可能残留的旧数据
+    for row in range(2, ws.max_row + 1):
+        ws.cell(row=row, column=col_new1).value = None
+        ws.cell(row=row, column=col_new2).value = None
 
     all_domains = [""] * total
     all_types = [""] * total
@@ -257,14 +264,7 @@ def main():
                 )
                 print(f"→ 发现无效代码 ({bad_summary})")
                 val_attempt += 1
-                if val_attempt < max_val_retries or args.retry_until_valid:
-                    retry_history = build_correction_prompt(invalid, batch_items)
-                else:
-                    for k, idx in enumerate(indices):
-                        all_domains[idx] = domains_list[k]
-                        all_types[idx] = types_list[k]
-                    print(f"   重试耗尽，保留原始结果")
-                    break
+                retry_history = build_correction_prompt(invalid, batch_items)
 
         if not success:
             for idx in indices:
