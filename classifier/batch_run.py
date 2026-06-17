@@ -141,16 +141,27 @@ def load_settings(config_path):
         "gbt": s.get("gbt", "classifier/gbt4754_2017_小类.txt"),
         "batch_size": int(s.get("batch_size", 50)),
         "retry_delay": int(s.get("retry_delay", 5)),
+        "models": s.get("models", ""),
     }
 
 
-def load_model_configs(config_path):
+def load_model_configs(config_path, selected_names=None):
     config = configparser.ConfigParser()
     config.read(config_path, encoding="utf-8")
+    all_sections = [s for s in config.sections() if s != "settings"]
+
+    if selected_names:
+        names = [n.strip() for n in selected_names.split(",") if n.strip()]
+        sections = [s for s in all_sections if s in names]
+        if not sections:
+            missing = set(names) - set(all_sections)
+            print(f"错误：settings.models 中指定的以下模型不存在: {missing}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        sections = all_sections
+
     models = []
-    for section in config.sections():
-        if section == "settings":
-            continue
+    for section in sections:
         models.append({
             "name": section,
             "base_url": config[section]["base_url"].rstrip("/"),
@@ -377,7 +388,7 @@ def main():
     gbt_path = args.gbt or settings["gbt"]
     batch_size = args.batch_size or settings["batch_size"]
     retry_delay = settings["retry_delay"]
-    model_configs = load_model_configs(args.config)
+    model_configs = load_model_configs(args.config, settings["models"])
 
     module_dir = Path(__file__).resolve().parent / "module-list"
     xlsx_files = sorted(module_dir.glob("*.xlsx"))
