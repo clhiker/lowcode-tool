@@ -140,6 +140,7 @@ def load_settings(config_path):
     return {
         "gbt": s.get("gbt", "classifier/gbt4754_2017_小类.txt"),
         "batch_size": int(s.get("batch_size", 50)),
+        "retry_delay": int(s.get("retry_delay", 5)),
     }
 
 
@@ -202,32 +203,21 @@ class SafeXlsxWriter:
         with self._completed_lock:
             self._completed += len(batch_indices)
 
-    def write_defaults(self, worker_id, batch_indices):
-        """写入默认值并保存。"""
-        with self._lock:
-            for idx in batch_indices:
-                row_idx = self.items[idx][0]
-                self.ws.cell(row=row_idx, column=self.col_new1).value = "通用（前端表单）"
-                self.ws.cell(row=row_idx, column=self.col_new2).value = "组件模板"
-            self.wb.save(self.xlsx_path)
-        with self._completed_lock:
-            self._completed += len(batch_indices)
-
     @property
     def completed(self):
         with self._completed_lock:
             return self._completed
 
-    def safe_print(self, worker_id, batch_start, batch_size, *args, **kwargs):
+    def safe_print(self, model_name, batch_start, batch_size, *args, **kwargs):
         with self.print_lock:
             c = self.completed
-            prefix = f"[W{worker_id}][{batch_start+1}-{batch_start+batch_size}/{self.total}]"
+            prefix = f"[{model_name}][{batch_start+1}-{batch_start+batch_size}/{self.total}]"
             print(prefix, *args, **kwargs)
 
 
 # ==================== Worker 逻辑 ====================
 
-def worker_loop(task_queue, writer, valid_codes, client, model_cfg, worker_id):
+def worker_loop(task_queue, writer, valid_codes, client, model_cfg, worker_id, retry_delay):
     while True:
         task = task_queue.get()
         if task is None:
@@ -238,14 +228,15 @@ def worker_loop(task_queue, writer, valid_codes, client, model_cfg, worker_id):
         batch_size = len(batch_items)
         mtokens = max(8192, batch_size * 2048)
 
-        success = False
         retry_history = ""
         val_attempt = 0
+        api_attempt = 0
 
         while True:
             tag = f"[修正 {val_attempt}]" if val_attempt > 0 else ""
-            writer.safe_print(worker_id, task.indices[0], batch_size,
-                              f"处理中{tag}...", end=" ", flush=True)
+            api_tag = f"[重试 {api_attempt}]" if api_attempt > 0 else ""
+            writer.safe_print(model_cfg["name"], task.indices[0], batch_size,
+                              f"处理中{tag}{api_tag}...", end=" ", flush=True)
 
             user_prompt = build_batch_prompt(batch_items)
             if retry_history:
@@ -257,37 +248,34 @@ def worker_loop(task_queue, writer, valid_codes, client, model_cfg, worker_id):
             ], max_tokens=mtokens)
 
             if not text:
-                writer.safe_print(worker_id, task.indices[0], batch_size,
-                                  "→ API失败")
-                break
+                api_attempt += 1
+                writer.safe_print(model_cfg["name"], task.indices[0], batch_size,
+                                  f"→ API失败，{retry_delay}秒后重试")
+                time.sleep(retry_delay)
+                continue
 
             domains_list, types_list = parse_batch_results(text, batch_size)
             invalid = validate_domains(domains_list, valid_codes)
 
             if not invalid:
-                success = True
                 writer.write_batch(worker_id, task.indices, domains_list, types_list)
-                writer.safe_print(worker_id, task.indices[0], batch_size, "→ 通过")
+                writer.safe_print(model_cfg["name"], task.indices[0], batch_size, "→ 通过")
                 break
             else:
                 bad_summary = "; ".join(
                     f"<{i+1}>: {','.join(codes)}" for i, codes in invalid
                 )
-                writer.safe_print(worker_id, task.indices[0], batch_size,
+                writer.safe_print(model_cfg["name"], task.indices[0], batch_size,
                                   f"→ 无效代码 ({bad_summary})")
                 val_attempt += 1
                 retry_history = build_correction_prompt(invalid, batch_items)
-
-        if not success:
-            writer.write_defaults(worker_id, task.indices)
-            writer.safe_print(worker_id, task.indices[0], batch_size, "→ 使用默认值")
 
         task_queue.task_done()
 
 
 # ==================== 单文件处理 ====================
 
-def process_xlsx(xlsx_path, model_configs, gbt_path, batch_size):
+def process_xlsx(xlsx_path, model_configs, gbt_path, batch_size, retry_delay):
     print(f"\n{'='*60}")
     print(f"处理文件: {xlsx_path.name}")
     print(f"{'='*60}")
@@ -352,7 +340,7 @@ def process_xlsx(xlsx_path, model_configs, gbt_path, batch_size):
         client = OpenAI(base_url=mc["base_url"], api_key=mc["api_key"])
         t = threading.Thread(
             target=worker_loop,
-            args=(task_queue, writer, valid_codes, client, mc, i + 1),
+            args=(task_queue, writer, valid_codes, client, mc, i + 1, retry_delay),
             daemon=True,
         )
         t.start()
@@ -388,6 +376,7 @@ def main():
     settings = load_settings(args.config)
     gbt_path = args.gbt or settings["gbt"]
     batch_size = args.batch_size or settings["batch_size"]
+    retry_delay = settings["retry_delay"]
     model_configs = load_model_configs(args.config)
 
     module_dir = Path(__file__).resolve().parent / "module-list"
@@ -398,7 +387,7 @@ def main():
 
     print(f"共 {len(xlsx_files)} 个文件待处理\n")
     for xf in xlsx_files:
-        process_xlsx(xf, model_configs, gbt_path, batch_size)
+        process_xlsx(xf, model_configs, gbt_path, batch_size, retry_delay)
 
     print(f"\n{'='*60}")
     print("全部处理完毕")
