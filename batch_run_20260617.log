@@ -1,0 +1,27 @@
+共 54 个文件待处理
+
+------------------------------------------------------------
+[1/54] 01_bpmn-模板清单.xlsx ... Traceback (most recent call last):
+  File "/home/clhiker/app/lowcode-tool/classifier/batch_run.py", line 57, in <module>
+    main()
+    ~~~~^^
+  File "/home/clhiker/app/lowcode-tool/classifier/batch_run.py", line 33, in main
+    result = subprocess.run(
+        [sys.executable, str(CLASSIFIER), "--xlsx", str(f)],
+    ...<2 lines>...
+        timeout=600,
+    )
+  File "/opt/miniconda3/lib/python3.13/subprocess.py", line 556, in run
+    stdout, stderr = process.communicate(input, timeout=timeout)
+                     ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/miniconda3/lib/python3.13/subprocess.py", line 1222, in communicate
+    stdout, stderr = self._communicate(input, endtime, timeout)
+                     ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/miniconda3/lib/python3.13/subprocess.py", line 2155, in _communicate
+    self._check_timeout(endtime, orig_timeout, stdout, stderr)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/miniconda3/lib/python3.13/subprocess.py", line 1269, in _check_timeout
+    raise TimeoutExpired(
+    ...<2 lines>...
+            stderr=b''.join(stderr_seq) if stderr_seq else None)
+subprocess.TimeoutExpired: Command '['/opt/miniconda3/bin/python3', '/home/clhiker/app/lowcode-tool/classifier/domain_classifier.py', '--xlsx', '/home/clhiker/app/lowcode-tool/classifier/module-list/01_bpmn-模板清单.xlsx']' timed out after 600 seconds
