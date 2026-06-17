@@ -149,18 +149,36 @@ def load_config(config_path, section):
     }
 
 
+def load_settings(config_path):
+    config = configparser.ConfigParser()
+    config.read(config_path, encoding="utf-8")
+    s = config["settings"] if config.has_section("settings") else {}
+    return {
+        "xlsx": s.get("xlsx", "classifier/51_FormVueLate_vue-模板结构.xlsx"),
+        "section": s.get("section", "sjtu_minimax"),
+        "gbt": s.get("gbt", "classifier/gbt4754_2017_小类.txt"),
+        "batch_size": int(s.get("batch_size", 50)),
+    }
+
+
 def main():
+    # 先解析 --config，读取 settings，再以 settings 为默认值解析剩余参数
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument("--config", default="classifier/config.ini")
+    pre_args, _ = pre_parser.parse_known_args()
+    settings = load_settings(pre_args.config)
+
     parser = argparse.ArgumentParser(
         description="从模板描述生成领域（GB/T 4754-2017）和类型标签"
     )
-    parser.add_argument("--xlsx", default="classifier/51_FormVueLate_vue-模板结构.xlsx",
+    parser.add_argument("--xlsx", default=settings["xlsx"],
                         help="输入的xlsx文件，结果将直接写入该文件的新增列")
-    parser.add_argument("--config", default="classifier/config.ini")
-    parser.add_argument("--section", default="sjtu_minimax",
+    parser.add_argument("--config", default=pre_args.config)
+    parser.add_argument("--section", default=settings["section"],
                         help="config.ini 中的配置节名称（默认 sjtu_minimax）")
-    parser.add_argument("--gbt", default="classifier/gbt4754_2017_小类.txt",
+    parser.add_argument("--gbt", default=settings["gbt"],
                         help="GB/T 4754-2017 小类代码文件路径")
-    parser.add_argument("-n", "--batch-size", type=int, default=50,
+    parser.add_argument("-n", "--batch-size", type=int, default=settings["batch_size"],
                         help="每次API调用合并的模板数（默认50）")
     args = parser.parse_args()
 
