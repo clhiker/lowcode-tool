@@ -105,19 +105,6 @@ def call_api(client, model, messages, max_tokens=8192, timeout=180):
         return None
 
 
-def build_correction_prompt(invalid_items, original_items):
-    lines = ["注意：你上次返回中存在不存在的 GB/T 4754-2017 代码，请修正："]
-    for idx, bad_codes in invalid_items:
-        codes_str = ", ".join(bad_codes)
-        lines.append(
-            f"  <{idx + 1}> 中的 {codes_str} 不存在，请替换为真实存在的分类。"
-        )
-    lines.append(
-        "只输出修正后的结果即可，格式与之前完全相同（每个模板一个块）。"
-    )
-    return "\n".join(lines)
-
-
 def evaluate_formula(val, row_idx):
     s = str(val)
     m = re.search(
@@ -188,7 +175,12 @@ class BatchTask:
 
 
 class SafeXlsxWriter:
-    """线程安全地逐批写入并保存 xlsx，最多丢一批进度。"""
+    """线程安全地逐批写入 worksheet 和临时文件，全部完成后一次性保存 xlsx。
+
+    tmp 文件格式（每行）: {全局索引}\\t{领域}\\t{类型}
+
+    支持断点续传：启动时从 tmp 恢复已完成条目，跳过对应批次。
+    """
 
     def __init__(self, wb, ws, col_new1, col_new2, items, xlsx_path):
         self.wb = wb
@@ -197,22 +189,47 @@ class SafeXlsxWriter:
         self.col_new2 = col_new2
         self.items = items  # [(row_idx, tid, desc, func), ...]
         self.xlsx_path = xlsx_path
+        self.tmp_path = xlsx_path.with_suffix(".tmp")
         self._lock = threading.Lock()
         self._completed = 0
         self._completed_lock = threading.Lock()
         self.print_lock = threading.Lock()
         self.total = len(items)
 
+    def load_checkpoint(self):
+        """读取 tmp 返回 {global_idx: (domain, type)}，不存在返回空 dict。"""
+        if not self.tmp_path.exists():
+            return {}
+        result = {}
+        with open(self.tmp_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split("\t")
+                if len(parts) >= 3:
+                    result[int(parts[0])] = (parts[1], parts[2])
+        return result
+
     def write_batch(self, worker_id, batch_indices, domain_list, type_list):
-        """立即写入 worksheet 并保存到磁盘。"""
+        """写入 in-memory worksheet 并追加到临时文件。"""
         with self._lock:
             for k, idx in enumerate(batch_indices):
                 row_idx = self.items[idx][0]
                 self.ws.cell(row=row_idx, column=self.col_new1).value = domain_list[k]
                 self.ws.cell(row=row_idx, column=self.col_new2).value = type_list[k]
-            self.wb.save(self.xlsx_path)
+            with open(self.tmp_path, "a", encoding="utf-8") as f:
+                for k, idx in enumerate(batch_indices):
+                    f.write(f"{idx}\t{domain_list[k]}\t{type_list[k]}\n")
         with self._completed_lock:
             self._completed += len(batch_indices)
+
+    def save_and_cleanup(self):
+        """保存 xlsx 并删除临时文件。"""
+        with self._lock:
+            self.wb.save(self.xlsx_path)
+        if self.tmp_path.exists():
+            self.tmp_path.unlink()
 
     @property
     def completed(self):
@@ -242,6 +259,7 @@ def worker_loop(task_queue, writer, valid_codes, client, model_cfg, worker_id, r
         retry_history = ""
         val_attempt = 0
         api_attempt = 0
+        known_bad = {}
 
         while True:
             tag = f"[修正 {val_attempt}]" if val_attempt > 0 else ""
@@ -272,14 +290,36 @@ def worker_loop(task_queue, writer, valid_codes, client, model_cfg, worker_id, r
                 writer.write_batch(worker_id, task.indices, domains_list, types_list)
                 writer.safe_print(model_cfg["name"], task.indices[0], batch_size, "→ 通过")
                 break
-            else:
-                bad_summary = "; ".join(
-                    f"<{i+1}>: {','.join(codes)}" for i, codes in invalid
-                )
+
+            # 累计本次的错误码
+            for local_idx, bad_codes in invalid:
+                if local_idx not in known_bad:
+                    known_bad[local_idx] = set()
+                known_bad[local_idx].update(bad_codes)
+
+            val_attempt += 1
+
+            if val_attempt >= 6:
+                bad_set = {local_idx for local_idx, _ in invalid}
+                bad_list = sorted(bad_set)
+                patched = [(i, domains_list[i]) for i in bad_list]
+                for local_idx in bad_list:
+                    domains_list[local_idx] = "6513 应用软件开发, 6519 其他软件开发"
+                writer.write_batch(worker_id, task.indices, domains_list, types_list)
                 writer.safe_print(model_cfg["name"], task.indices[0], batch_size,
-                                  f"→ 无效代码 ({bad_summary})")
-                val_attempt += 1
-                retry_history = build_correction_prompt(invalid, batch_items)
+                                  f"→ 校验失败{val_attempt}次，第{len(bad_list)}项强制设为 6513 应用软件开发")
+                break
+
+            # 用累计的错误码构建修正提示
+            bad_lines = []
+            for local_idx in sorted(known_bad):
+                codes = ", ".join(sorted(known_bad[local_idx]))
+                bad_lines.append(f"  <{local_idx + 1}> 中曾出现 {codes}，请替换为真实存在的分类。")
+            retry_history = (
+                "注意：以下代码在之前的回答中反复使用了不存在的 GB/T 4754-2017 代码，请务必修正：\n"
+                + "\n".join(bad_lines)
+                + "\n只输出修正后的结果即可，格式与之前完全相同（每个模板一个块）。"
+            )
 
         task_queue.task_done()
 
@@ -338,12 +378,37 @@ def process_xlsx(xlsx_path, model_configs, gbt_path, batch_size, retry_delay):
     # 创建线程安全写入器
     writer = SafeXlsxWriter(wb, ws, col_new1, col_new2, items, xlsx_path)
 
-    # 填充任务队列
+    # 断点续传：从 tmp 恢复已完成条目
+    checkpoint = writer.load_checkpoint()
+    done_indices = set()
+    if checkpoint:
+        done_indices = set(checkpoint.keys())
+        print(f"发现断点文件，已有 {len(done_indices)}/{total} 个条目完成，跳过对应批次")
+        for idx, (domain, type_) in checkpoint.items():
+            row_idx = items[idx][0]
+            ws.cell(row=row_idx, column=col_new1).value = domain
+            ws.cell(row=row_idx, column=col_new2).value = type_
+        writer._completed = len(done_indices)
+
+    # 填充任务队列（跳过已完成的批次）
     task_queue = queue.Queue()
+    queued = 0
     for start in range(0, total, batch_size):
         batch = items[start:start + batch_size]
         indices = list(range(start, start + len(batch)))
+        if done_indices and done_indices.issuperset(set(indices)):
+            continue
         task_queue.put(BatchTask(batch_id=start // batch_size, items=batch, indices=indices))
+        queued += len(batch)
+
+    if task_queue.empty():
+        print("所有条目已完成，直接保存 xlsx")
+        writer.save_and_cleanup()
+        elapsed = time.time() - t0
+        print(f"\n  ✓ 完成！耗时 {elapsed:.1f}s（已保存至 {xlsx_path.name}）")
+        return
+
+    print(f"剩余 {queued} 个模板，{task_queue.qsize()} 个批次，{len(model_configs)} 个 worker 并发")
 
     # 启动 worker 线程
     threads = []
@@ -366,8 +431,11 @@ def process_xlsx(xlsx_path, model_configs, gbt_path, batch_size, retry_delay):
     for t in threads:
         t.join()
 
+    # 一次性保存 xlsx 并删除临时文件
+    writer.save_and_cleanup()
+
     elapsed = time.time() - t0
-    print(f"\n  ✓ 完成！耗时 {elapsed:.1f}s（已逐批保存至 {xlsx_path.name}）")
+    print(f"\n  ✓ 完成！耗时 {elapsed:.1f}s（已保存至 {xlsx_path.name}）")
 
 
 # ==================== 入口 ====================
