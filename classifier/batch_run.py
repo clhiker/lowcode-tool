@@ -335,17 +335,17 @@ def process_xlsx(xlsx_path, model_configs, gbt_path, batch_size, retry_delay):
     t0 = time.time()
 
     wb = openpyxl.load_workbook(xlsx_path)
-    ws = wb["汇总表"]
+    ws = wb[wb.sheetnames[0]]
 
     col_id, col_func, col_desc = 1, 8, 11
 
     items = []
     for row_idx in range(2, ws.max_row + 1):
-        tid_raw = ws.cell(row=row_idx, column=col_id).value
         desc = ws.cell(row=row_idx, column=col_desc).value
-        if not tid_raw or not desc or not str(desc).strip():
+        if not desc or not str(desc).strip():
             continue
-        tid = evaluate_formula(tid_raw, row_idx)
+        tid_raw = ws.cell(row=row_idx, column=col_id).value
+        tid = evaluate_formula(tid_raw, row_idx) if tid_raw else ""
         func = ws.cell(row=row_idx, column=col_func).value or ""
         items.append((row_idx, str(tid).strip(), str(desc).strip(), str(func).strip()))
 
@@ -357,7 +357,7 @@ def process_xlsx(xlsx_path, model_configs, gbt_path, batch_size, retry_delay):
     n_batches = (total + batch_size - 1) // batch_size
     print(f"共 {total} 个模板，batch-size={batch_size}，{n_batches} 个批次，{len(model_configs)} 个 worker 并发")
 
-    # 找到/创建新增列
+    # 找到新增列
     col_new1 = col_new2 = None
     for col in range(1, ws.max_column + 1):
         h = ws.cell(row=1, column=col).value
@@ -365,6 +365,21 @@ def process_xlsx(xlsx_path, model_configs, gbt_path, batch_size, retry_delay):
             col_new1 = col
         elif h == "新增列2":
             col_new2 = col
+
+    # 两列都存在且所有有效行已填满 → 跳过
+    if col_new1 and col_new2:
+        all_filled = True
+        for row_idx, _, _, _ in items:
+            v1 = ws.cell(row=row_idx, column=col_new1).value
+            v2 = ws.cell(row=row_idx, column=col_new2).value
+            if not v1 or not str(v1).strip() or not v2 or not str(v2).strip():
+                all_filled = False
+                break
+        if all_filled:
+            print("已有完整结果，跳过")
+            return
+
+    # 创建或清理输出列
     if col_new1 is None:
         col_new1 = ws.max_column + 1
         ws.cell(row=1, column=col_new1).value = "新增列1"
